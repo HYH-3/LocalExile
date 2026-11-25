@@ -102,6 +102,7 @@ public sealed class ExpeditionEncounter : IDisposable
     const string RelicType = "Metadata/MiscellaneousObjects/Expedition/ExpeditionRelic";
     const string EffectType = ExpeditionTables.EffectType;
     const string MapOwnerFlag = "IsMapOwner";
+    const int ChestSize = 2;
 
     // The encounter's own draws, apart from the packs' ("EXPD").
     const int Salt = 0x45585044;
@@ -280,6 +281,8 @@ public sealed class ExpeditionEncounter : IDisposable
             // A module loaded into a running area has had no AreaGenerated.
             await Ensure(log, player, state);
             if (state.Plan is not { } plan) return;
+            foreach (var (chestId, chest) in state.Chests)
+                player.SetObjectBlocker(chestId, chest.Cell.X, chest.Cell.Y, ChestSize, true);
             var types = new List<(ushort Row, byte Level)>();
             byte level = AreaLevel(player);
             foreach (int row in ExpeditionTables.VarietiesOf(plan.FactionId))
@@ -402,6 +405,31 @@ public sealed class ExpeditionEncounter : IDisposable
         await SendWorldRemoval(player, id, $"Expedition object 0x{id:x} removed");
     }
 
+    /// <summary>Removes un-detonated remnants and un-dug markers when the encounter ends so hover panels do not linger.</summary>
+    static Task DropLeftovers(Player player, State state, Plan plan)
+    {
+        var gone = new List<Task>();
+        for (int i = 0; i < plan.Remnants.Count; i++)
+            if (!state.Broken.Contains(i) && plan.Remnants[i].Id != 0)
+                gone.Add(Drop(player, state, plan.Remnants[i].Id));
+        for (int i = 0; i < plan.Markers.Count; i++)
+            if (!state.Dug.Contains(i) && plan.Markers[i].Id != 0)
+                gone.Add(Drop(player, state, plan.Markers[i].Id));
+        return Task.WhenAll(gone);
+    }
+
+    /// <summary>Registers an excavated chest's walk blocker (<c>Chest.ot</c> <c>object_size = 2</c>) on all live clients.</summary>
+    static void BlockChest(Player player, uint chestId, Chest chest)
+    {
+        bool hit = false;
+        foreach (var peer in Clients(player))
+        {
+            peer.SetObjectBlocker(chestId, chest.Cell.X, chest.Cell.Y, ChestSize, true);
+            if (ReferenceEquals(peer, player)) hit = true;
+        }
+        if (!hit) player.SetObjectBlocker(chestId, chest.Cell.X, chest.Cell.Y, ChestSize, true);
+    }
+
     static Task Update(Player player, uint id, byte[]? bytes, string log) =>
         bytes is null ? Task.CompletedTask : SendWorldRecord(player, id, bytes, log);
 
@@ -508,6 +536,7 @@ public sealed class ExpeditionEncounter : IDisposable
             {
                 state.Stage = Stage.Over;
                 await UpdateDetonator(player, state);
+                await DropLeftovers(player, state, plan);
             }
         }
         finally { state.Gate.Release(); }
@@ -677,6 +706,7 @@ public sealed class ExpeditionEncounter : IDisposable
                 if (await Keep(player, state, chestId, marker.ChestType, "chest", () => ExpeditionWire.Object(chest.Type, chest.Cell, 0, level,
                     interaction: (byte)(chest.Ready && !chest.Opened ? 0x01 : 0x00), stateValues: [chest.Opened ? 3 : chest.Ready ? 2 : 1])) is null) continue;
                 state.Chests[chestId] = chest;
+                BlockChest(player, chestId, chest);
                 Schedule(state, state.Clock + ExpeditionTables.ChestReadyFrames / ExpeditionTables.FramesPerSecond, "chest", (int)chestId);
                 continue;
             }
@@ -737,7 +767,11 @@ public sealed class ExpeditionEncounter : IDisposable
     /// the floor.</summary>
     async Task OpenChest(Player player, State state, uint chestId)
     {
-        if (!state.Chests.TryGetValue(chestId, out var chest) || !chest.Ready || chest.Opened) return;
+        if (!state.Chests.TryGetValue(chestId, out var chest) || !chest.Ready || chest.Opened)
+        {
+            Console.WriteLine($"[gateway] Expedition: chest 0x{chestId:x} click ignored (found={chest is not null}, ready={chest?.Ready}, opened={chest?.Opened})");
+            return;
+        }
         chest.Opened = true;
         await Update(player, chestId, ExpeditionWire.ComponentUpdate(chestId, chest.Type, "InteractionAction", 0x00), "Expedition chest interaction off");
         await Update(player, chestId, ExpeditionWire.ComponentUpdate(chestId, chest.Type, "ObjectMagicProperties", 0x08, 0x00, 0x00, 0x00),
@@ -776,18 +810,34 @@ public sealed class ExpeditionEncounter : IDisposable
     {
         if (player.Instance is null || !_states.TryGetValue(player.Instance, out var state) || state.Plan is null) return false;
         if (use.TargetId == state.DetonatorId && state.Revealed)
-            return await Interact(player, state, use, requestedAt, state.Plan.Detonator, 4, () => Detonate(player, state));
+            return await Interact(player, state, use, requestedAt, state.Plan.Detonator, 4, "detonator", () => Detonate(player, state));
         if (!state.Chests.TryGetValue(use.TargetId, out var chest)) return false;
-        return await Interact(player, state, use, requestedAt, chest.Cell, 2, () => OpenChest(player, state, use.TargetId));
+        if (chest.Opened)
+        {
+            Console.WriteLine($"[gateway] Expedition: chest 0x{use.TargetId:x} already opened");
+            int current = player.ActionCount;
+            await SendWorldRecord(player, player.Id, InstanceProtocol.ActionEnded(player.Id), null,
+                still: () => PlayerActionCurrent(player, current));
+            return true;
+        }
+        return await Interact(player, state, use, requestedAt, chest.Cell, ChestSize, $"chest 0x{use.TargetId:x}", () => OpenChest(player, state, use.TargetId));
     }
 
     /// <summary>A click on an object as the other walked-up objects take it (MapStrongboxes.Use): the walk up, the action's start
     /// and end, nothing for a dead, closing or leaving player, and the work only if the player is still in reach once there.</summary>
     static async Task<bool> Interact(Player player, State state, InstanceTransfer.UseSkillOnObject use, double requestedAt,
-        (int X, int Y) at, int reach, Func<Task> act)
+        (int X, int Y) at, int reach, string label, Func<Task> act)
     {
-        if (player.PlayerLife == 0 || player.Closed || player.LeavingArea) return true;
-        if (!TryBeginObjectWalk(player, requestedAt, at.X, at.Y, reach, out var walk)) return true;
+        if (player.PlayerLife == 0 || player.Closed || player.LeavingArea)
+        {
+            Console.WriteLine($"[gateway] Expedition: {label} click ignored (life={player.PlayerLife}, closed={player.Closed}, leaving={player.LeavingArea})");
+            return true;
+        }
+        if (!TryBeginObjectWalk(player, requestedAt, at.X, at.Y, reach, out var walk))
+        {
+            Console.WriteLine($"[gateway] Expedition: {label} walk rejected from {player.Walk.Position(AreaTime(player))} to {at} (reach={reach})");
+            return true;
+        }
         var (action, now, here, _, arrive) = walk;
         if (!use.Started)
             await SendWorldRecord(player, player.Id,
@@ -797,9 +847,13 @@ public sealed class ExpeditionEncounter : IDisposable
         await state.Gate.WaitAsync();
         try
         {
-            if (PlayerActionCurrent(player, action) && player.PlayerLife > 0 && !player.Closed && !player.LeavingArea
-                && PlayerWalk.InWalkUpRange(player.Walk.Position(AreaTime(player)), at, reach))
+            bool current = PlayerActionCurrent(player, action);
+            var pos = player.Walk.Position(AreaTime(player));
+            bool inRange = PlayerWalk.InWalkUpRange(pos, at, reach);
+            if (current && player.PlayerLife > 0 && !player.Closed && !player.LeavingArea && inRange)
                 await act();
+            else
+                Console.WriteLine($"[gateway] Expedition: {label} click cancelled (current={current}, life={player.PlayerLife}, closed={player.Closed}, leaving={player.LeavingArea}, at={pos}, target={at}, reach={reach})");
         }
         finally
         {

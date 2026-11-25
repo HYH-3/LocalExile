@@ -346,4 +346,213 @@ public sealed class ExpeditionTests
             _ => throw new NotSupportedException(method.Name),
         };
     }
+
+    [GameFilesFact]
+    public async Task Expedition_completion_drops_undetonated_remnants_and_undug_markers()
+    {
+        await using var run = await SingleChestRun.StartAsync();
+        await run.FinishEncounterAsync();
+
+        var afterIds = JoinSnapshot(run.First.Player.Area, new Player(run.Layout, 1, run.Seed)).Select(r => r.Entity).ToHashSet();
+        Assert.Contains(run.DetonatorId, afterIds);
+
+        var undetonatedRemnants = Enumerable.Range(0, run.Plan.Remnants.Count)
+            .Where(i => Distance(run.Plan.Remnants[i].Cell, run.PlaceCell) >= ExpeditionTables.BlastRadius)
+            .Select(i => run.RemnantId(i))
+            .ToList();
+        var undugMarkers = Enumerable.Range(0, run.Plan.Markers.Count)
+            .Where(i => Distance(run.Plan.Markers[i].Cell, run.PlaceCell) >= ExpeditionTables.BlastRadius)
+            .Select(i => run.MarkerId(i))
+            .ToList();
+        Assert.NotEmpty(undetonatedRemnants);
+        Assert.NotEmpty(undugMarkers);
+
+        foreach (uint id in undetonatedRemnants) Assert.DoesNotContain(id, afterIds);
+        foreach (uint id in undugMarkers) Assert.DoesNotContain(id, afterIds);
+
+        byte[] wire = await run.First.Finish();
+        Assert.True(Contains(wire, InstanceProtocol.RemoveObject(undetonatedRemnants[0])), "0x02bd removal for un-detonated remnant");
+        Assert.True(Contains(wire, InstanceProtocol.RemoveObject(undugMarkers[0])), "0x02bd removal for un-dug marker");
+
+        // A player joining after Stage.Over is not sent any dropped remnant or marker creates.
+        await using var late = await Wire.Open(run.Layout, run.Seed, run.Instance, "ExpeditionLate");
+        late.Player.Connection.LockstepClient = false;
+        await run.Encounter.OnPlayerEntered(_ => { }, late.Player);
+        var replayIds = JoinSnapshot(run.First.Player.Area, late.Player).Select(r => r.Entity).ToHashSet();
+        foreach (uint id in undetonatedRemnants) Assert.DoesNotContain(id, replayIds);
+        foreach (uint id in undugMarkers) Assert.DoesNotContain(id, replayIds);
+    }
+
+    [GameFilesFact]
+    public async Task Expedition_excavated_chest_registers_blocker_and_opens_on_interact()
+    {
+        await using var run = await SingleChestRun.StartAsync();
+        await run.FinishEncounterAsync();
+
+        var afterIds = JoinSnapshot(run.First.Player.Area, new Player(run.Layout, 1, run.Seed)).Select(r => r.Entity).ToHashSet();
+        var chestIds = afterIds.Where(id => !run.BeforeIds.Contains(id) && run.First.Player.StationaryPosition(id) is not null).ToList();
+        Assert.NotEmpty(chestIds);
+        uint chestId = chestIds[0];
+        var chestCell = run.First.Player.StationaryPosition(chestId)!.Value;
+        Assert.Equal(2, run.First.Player.StationaryInteractionSize(chestId));
+
+        // A later entrant in the same area also receives the chest blocker.
+        await using var guest = await Wire.Open(run.Layout, run.Seed, run.Instance, "ExpeditionGuest");
+        guest.Player.Connection.LockstepClient = false;
+        await run.Encounter.OnPlayerEntered(_ => { }, guest.Player);
+        Assert.Equal(chestCell, guest.Player.StationaryPosition(chestId));
+        Assert.Equal(2, guest.Player.StationaryInteractionSize(chestId));
+
+        // Refused click (dead player) leaves the chest closed, then an in-range click opens it.
+        run.First.Player.PlayerLife = 0;
+        Assert.True(await run.Encounter.OnUse(run.First.Player, new InstanceTransfer.UseSkillOnObject(chestId, 1, 1, 0), 0));
+        run.First.Player.PlayerLife = 5000;
+        run.First.Player.Walk.Teleport(chestCell.X, chestCell.Y, 0);
+        Assert.True(await run.Encounter.OnUse(run.First.Player, new InstanceTransfer.UseSkillOnObject(chestId, 1, 2, 0), 0));
+        // Clicking an already-opened chest is handled without throwing.
+        Assert.True(await run.Encounter.OnUse(run.First.Player, new InstanceTransfer.UseSkillOnObject(chestId, 1, 3, 0), 0));
+
+        byte[] wire = await run.First.Finish();
+        string chestType = run.Plan.Markers.First(m => m.Kind == ExpeditionTables.MarkerKind.Chest && m.Cell == chestCell).ChestType;
+        Assert.True(Contains(wire, ExpeditionWire.ComponentUpdate(chestId, chestType, "ObjectMagicProperties", 0x08, 0x00, 0x00, 0x00)!));
+        Assert.True(Contains(wire, ExpeditionWire.StateUpdate(chestId, chestType, [3], true)!));
+    }
+
+    static double Distance((int X, int Y) a, (int X, int Y) b) =>
+        Math.Sqrt((double)(a.X - b.X) * (a.X - b.X) + (double)(a.Y - b.Y) * (a.Y - b.Y));
+
+    static List<AreaDelta.Record> JoinSnapshot(GameArea area, Player probe)
+    {
+        var owner = GameArea.Own(area);
+        try
+        {
+            area.Objects.Join(probe);
+            List<AreaDelta.Record> all = [];
+            for (int frame = 0; frame < 6; frame++) all.AddRange(area.Delta.Take());
+            return all;
+        }
+        finally { GameArea.Own(owner); }
+    }
+
+    sealed class SingleChestRun : IAsyncDisposable
+    {
+        readonly IGameLogic? _previousLogic;
+        readonly IModuleLifetime? _previousLifetime;
+        readonly ModuleLifetime _lifetime;
+
+        public required AreaLayout Layout { get; init; }
+        public required uint Seed { get; init; }
+        public required InstanceState Instance { get; init; }
+        public required Wire First { get; init; }
+        public required ExpeditionEncounter Encounter { get; init; }
+        public required ExpeditionEncounter.Plan Plan { get; init; }
+        public required ExpeditionEncounter.Marker ChestMarker { get; init; }
+        public required (int X, int Y) PlaceCell { get; init; }
+        public required uint DetonatorId { get; init; }
+        public required HashSet<uint> BeforeIds { get; init; }
+
+        SingleChestRun(IGameLogic? previousLogic, IModuleLifetime? previousLifetime, ModuleLifetime lifetime)
+        {
+            _previousLogic = previousLogic;
+            _previousLifetime = previousLifetime;
+            _lifetime = lifetime;
+        }
+
+        public uint MarkerId(int index) => DetonatorId + 1 + (uint)index;
+        public uint RemnantId(int index) => DetonatorId + 1 + (uint)Plan.Markers.Count + (uint)index;
+
+        public static async Task<SingleChestRun> StartAsync()
+        {
+            ExpeditionModule.LoadData();
+            var previousLogic = Program.GameLogicOrNull;
+            var previousLifetime = Game.CombatLifetime;
+            var lifetime = new ModuleLifetime("Game");
+            Game.CombatLifetime = lifetime;
+            Program.SetGameLogic(new GameServer.Modules.Game.GameLogic(lifetime));
+
+            const string area = "MapWorldsForbiddenWoods";
+            byte[] kept = [0x04, 0x00];
+            uint seed = ServerLevels.PlayableSeed(area, 1304805886, 0, null, LeagueCategory.None, [((ushort)0x086a, kept)]);
+            ushort hash = (ushort)ClientTables.Table("WorldAreas").First(r => r.TextOrNull("Id") == area).Int("HASH16");
+            var layout = AreaLayouts.For(hash, seed);
+            var instance = new InstanceState();
+            var first = await Wire.Open(layout, seed, instance, "ExpeditionOwner");
+            first.Player.Connection.LockstepClient = false;
+            var standard = LeagueCatalog.FromFolder("Leagues").Find("Standard")!;
+            first.Player.LeagueModule = new(standard, ServerLeagues.ModulesOf(standard));
+            Program.InGame[first.Player] = 0;
+
+            var encounter = new ExpeditionEncounter();
+            var plan = ExpeditionEncounter.MakePlan(first.Player, ServerLevels.AreaLevel(area))!;
+            Assert.NotNull(plan);
+
+            await encounter.OnAreaGenerated(_ => { }, first.Player);
+            await encounter.OnPlayerEntered(_ => { }, first.Player);
+            first.Player.Walk.Teleport(plan.Detonator.X, plan.Detonator.Y, 0);
+            await encounter.TickFor(first.Player)!(first.Player, 0.1);
+
+            var beforeIds = JoinSnapshot(first.Player.Area, new Player(layout, 1, seed)).Select(r => r.Entity).ToHashSet();
+            uint detonatorId = beforeIds.Min();
+            var chestMarker = plan.Markers.First(m => m.Kind == ExpeditionTables.MarkerKind.Chest);
+            var placeCell = FindWalkablePlacement(layout, plan.Detonator, chestMarker.Cell);
+
+            return new(previousLogic, previousLifetime, lifetime)
+            {
+                Layout = layout,
+                Seed = seed,
+                Instance = instance,
+                First = first,
+                Encounter = encounter,
+                Plan = plan,
+                ChestMarker = chestMarker,
+                PlaceCell = placeCell,
+                DetonatorId = detonatorId,
+                BeforeIds = beforeIds,
+            };
+        }
+
+        public async Task FinishEncounterAsync()
+        {
+            using (GameEvents.AreaQuestFlags.Add("Expedition", Encounter.QuestFlags))
+            {
+                byte[] place = [0x02, 0xca, ExpeditionTables.RulesetRow!.Value, 10, 0x00,
+                    .. BitConverter.GetBytes(PlaceCell.X), .. BitConverter.GetBytes(PlaceCell.Y), 4];
+                Assert.True(await Encounter.RulesetAction(First.Player, place));
+            }
+            Assert.True(await Encounter.OnUse(First.Player, new InstanceTransfer.UseSkillOnObject(DetonatorId, 1, 1, 0), 0));
+            var tick = Encounter.TickFor(First.Player)!;
+            for (int step = 0; step < 100; step++)
+            {
+                await tick(First.Player, 0.1);
+                foreach (var monster in First.Player.Area.Monsters.Values)
+                    Encounter.OnKill(new(First.Player, monster, "", (0, 0)));
+            }
+        }
+
+        static (int X, int Y) FindWalkablePlacement(AreaLayout layout, (int X, int Y) detonator, (int X, int Y) target)
+        {
+            for (int r = 0; r < (int)ExpeditionTables.BlastRadius; r++)
+                for (int dy = -r; dy <= r; dy++)
+                    for (int dx = -r; dx <= r; dx++)
+                    {
+                        var cell = (target.X + dx, target.Y + dy);
+                        if (cell.Item1 >= 0 && cell.Item2 >= 0 && cell.Item1 < layout.GridW && cell.Item2 < layout.GridH
+                            && layout.WalkableFor(cell.Item1, cell.Item2, 0)
+                            && Distance(cell, detonator) <= ExpeditionTables.PlaceRange
+                            && Distance(cell, target) < ExpeditionTables.BlastRadius)
+                            return cell;
+                    }
+            throw new InvalidOperationException("No walkable placement found near chest marker.");
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            Program.InGame.TryRemove(First.Player, out _);
+            Encounter.Dispose();
+            await First.DisposeAsync();
+            _lifetime.Stop(ex => throw ex);
+            Game.CombatLifetime = _previousLifetime!;
+            Program.SetGameLogic(_previousLogic!);
+        }
+    }
 }
